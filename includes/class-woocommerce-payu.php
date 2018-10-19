@@ -5,15 +5,24 @@ require_once 'OauthCacheWP.php';
 
 class WC_Gateway_PayU extends WC_Payment_Gateway
 {
-    private $pluginVersion = '1.2.7';
 
+    private $pluginVersion = '1.2.6';
+
+    private $pos_id;
+    private $md5;
+    private $client_id;
+    private $client_secret;
     private $payu_feedback;
     private $sandbox;
+    private $sandbox_pos_id;
+    private $sandbox_md5;
+    private $sandbox_client_id;
+    private $sandbox_client_secret;
 
     function __construct()
     {
         $this->id = 'payu';
-        $this->has_fields = false;
+	    $this->has_fields = apply_filters( 'woocommerce_payu_has_fields', false );
         $this->method_title = __('PayU', 'payu');
         $this->method_description = __('Official PayU payment gateway for WooCommerce.', 'payu');
         $this->icon = apply_filters('woocommerce_payu_icon', 'https://static.payu.com/plugins/woocommerce_payu_logo.png');
@@ -27,8 +36,16 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
 
         $this->title = $this->get_option('title');
         $this->description = $this->get_option('description');
+        $this->pos_id = $this->get_option('pos_id');
+        $this->md5 = $this->get_option('md5');
+        $this->client_id = $this->get_option('client_id');
+        $this->client_secret = $this->get_option('client_secret');
         $this->payu_feedback = $this->get_option('payu_feedback');
         $this->sandbox = $this->get_option('sandbox');
+        $this->sandbox_pos_id = $this->get_option('sandbox_pos_id');
+        $this->sandbox_md5 = $this->get_option('sandbox_md5');
+        $this->sandbox_client_id = $this->get_option('sandbox_client_id');
+        $this->sandbox_client_secret = $this->get_option('sandbox_client_secret');
 
         // Saving hook
         add_action('woocommerce_update_options_payment_gateways_' . $this->id, array($this, 'process_admin_options'));
@@ -42,28 +59,13 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
         $this->init_OpenPayU();
     }
 
-    protected function init_OpenPayU($currency = null)
+    protected function init_OpenPayU()
     {
-        global $woocommerce_wpml;
-
-        $isSandbox = 'yes' === $this->get_option('sandbox');
-
-        if ($woocommerce_wpml
-            && property_exists($woocommerce_wpml, 'multi_currency')
-            && count($woocommerce_wpml->multi_currency->get_currency_codes()) > 1)
-        {
-            $optionSuffix = '_' . (null !== $currency ? $currency : get_woocommerce_currency());
-        } else {
-            $optionSuffix = '';
-        }
-
-        $optionPrefix = $isSandbox ? 'sandbox_' : '';
-
-        OpenPayU_Configuration::setEnvironment($isSandbox ? 'sandbox' : 'secure');
-        OpenPayU_Configuration::setMerchantPosId($this->get_option($optionPrefix . 'pos_id' . $optionSuffix));
-        OpenPayU_Configuration::setSignatureKey($this->get_option($optionPrefix . 'md5' . $optionSuffix));
-        OpenPayU_Configuration::setOauthClientId($this->get_option($optionPrefix . 'client_id' . $optionSuffix));
-        OpenPayU_Configuration::setOauthClientSecret($this->get_option($optionPrefix . 'client_secret' . $optionSuffix));
+        OpenPayU_Configuration::setEnvironment($this->isSanbox() ? 'sandbox' : 'secure');
+        OpenPayU_Configuration::setMerchantPosId($this->isSanbox() ? $this->sandbox_pos_id : $this->pos_id);
+        OpenPayU_Configuration::setSignatureKey($this->isSanbox() ? $this->sandbox_md5 : $this->md5);
+        OpenPayU_Configuration::setOauthClientId($this->isSanbox() ? $this->sandbox_client_id : $this->client_id);
+        OpenPayU_Configuration::setOauthClientSecret($this->isSanbox() ? $this->sandbox_client_secret : $this->client_secret);
 
         OpenPayU_Configuration::setOauthTokenCache(new OauthCacheWP());
         OpenPayU_Configuration::setSender('Wordpress ver ' . get_bloginfo('version') . ' / WooCommerce ver ' . WC()->version . ' / Plugin ver ' . $this->pluginVersion);
@@ -85,18 +87,8 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
 
     function init_form_fields()
     {
-        global $woocommerce_wpml;
-
-        $currencies = [];
-
-        if ($woocommerce_wpml
-            && property_exists($woocommerce_wpml, 'multi_currency')
-            && count($woocommerce_wpml->multi_currency->get_currency_codes()) > 1)
-        {
-            $currencies = $woocommerce_wpml->multi_currency->get_currency_codes();
-        }
-
-        $this->form_fields = array_merge($this->getFormFieldsBasic(), $this->getFormFieldConfig($currencies), $this->getFormFieldInfo());
+        $this->form_fields = include('form-fields.php');
+	    $this->form_fields = apply_filters( 'woocommerce_payu_form_fields', $this->form_fields );
     }
 
     function process_payment($order_id)
@@ -128,10 +120,14 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
             )
         );
 
+	    $orderData = apply_filters( 'woocommerce_payu_order_args', $orderData, $order );
+
         try {
             $response = OpenPayU_Order::create($orderData);
 
-            if ($response->getStatus() === OpenPayU_Order::SUCCESS) {
+	        $isSuccess = apply_filters( 'woocommerce_payu_order_status', $response->getStatus() === OpenPayU_Order::SUCCESS, $order, $response );
+
+	        if ( $isSuccess ) {
 
                 $this->reduceStock($order);
                 WC()->cart->empty_cart();
@@ -140,9 +136,11 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
 
                 add_post_meta($order_id, '_transaction_id', $response->getResponse()->orderId, true);
 
+                $url = apply_filters( 'woocommerce_payu_payment_redirect_url', $response->getResponse()->redirectUri . '&lang=' . $this->getLanguage(), $order, $response );
+
                 return array(
                     'result' => 'success',
-                    'redirect' => $response->getResponse()->redirectUri . '&lang=' . $this->getLanguage()
+                    'redirect' => $url
                 );
             } else {
                 wc_add_notice(__('Payment error. Status code: ', 'payu') . $response->getStatus(), 'error');
@@ -161,12 +159,6 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
         if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $body = file_get_contents('php://input');
             $data = trim($body);
-
-            $currency = $this->extractCurrencyFromNotification($data);
-
-            if (null !== $currency) {
-                $this->init_OpenPayU($currency);
-            }
 
             try {
                 $response = OpenPayU_Order::consumeNotification($data);
@@ -232,8 +224,6 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
             return false;
         }
 
-        $this->init_OpenPayU($order->get_currency());
-
         $refund = OpenPayU_Refund::create(
             $orderId,
             __('Refund of: ', 'payu') . ' ' . $amount . $this->getOrderCurrency($order) . __(' for order: ', 'payu') . $order_id,
@@ -243,13 +233,15 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
         return ($refund->getStatus() == 'SUCCESS');
     }
 
+	public function payment_fields() {
+		do_action( 'woocommerce_payu_payment_fields' );
+	}
+
     public function change_status_action($order_id, $old_status, $new_status)
     {
         if ($this->payu_feedback == 'yes' && isset($_REQUEST['_wpnonce'])) {
             $order = wc_get_order($order_id);
             $orderId = $order->get_transaction_id();
-
-            $this->init_OpenPayU($order->get_currency());
 
             if (empty($orderId)) {
                 return false;
@@ -308,17 +300,11 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
     }
 
     /**
-     * @param string $notification
-     * @return null|string
+     * @return bool
      */
-    private function extractCurrencyFromNotification($notification)
+    private function isSanbox()
     {
-        $notification = json_decode($notification);
-
-        if (is_object($notification) && $notification->order && $notification->order->currencyCode) {
-            return $notification->order->currencyCode;
-        }
-        return null;
+        return 'yes' === $this->sandbox;
     }
 
     /**
@@ -329,127 +315,6 @@ class WC_Gateway_PayU extends WC_Payment_Gateway
         return ($_SERVER['REMOTE_ADDR'] == '::1' || $_SERVER['REMOTE_ADDR'] == '::' ||
             !preg_match('/^((?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9]).){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])$/m',
                 $_SERVER['REMOTE_ADDR'])) ? '127.0.0.1' : $_SERVER['REMOTE_ADDR'];
-    }
-
-    /**
-     * @return array
-     */
-    private function getFormFieldsBasic()
-    {
-        return array(
-            'enabled' => array(
-                'title' => __('Enable/Disable', 'woocommerce'),
-                'label' => __('Enable PayU payment method', 'payu'),
-                'type' => 'checkbox',
-                'description' => __('If you do not already have PayU merchant account, <a href="https://secure.payu.com/boarding/#/form&pk_campaign=Plugin&pk_kwd=WooCommerce" target="_blank">please register in Production</a> or <a href="https://secure.snd.payu.com/boarding/#/form&pk_campaign=Plugin&pk_kwd=WooCommerce" target="_blank">please register in Sandbox</a>.', 'payu'),
-                'default' => 'no',
-            ),
-            'title' => array(
-                'title' => __('Title:', 'payu'),
-                'type' => 'text',
-                'description' => __('Title of PayU Payment Gateway that users sees on Checkout page.', 'payu'),
-                'default' => __('PayU', 'payu'),
-                'desc_tip' => true
-            ),
-            'sandbox' => array(
-                'title' => __('Sandbox mode:', 'payu'),
-                'type' => 'checkbox',
-                'label' => __('Use sandbox environment.', 'payu'),
-                'default' => 'no'
-            ));
-    }
-
-    /**
-     * @return array
-     */
-    private function getFormFieldInfo()
-    {
-        return array(
-            'description' => array(
-                'title' => __('Description:', 'payu'),
-                'type' => 'text',
-                'description' => __('Description of PayU Payment Gateway that users sees on Checkout page.', 'payu'),
-                'default' => __('PayU is a leading payment services provider with presence in 16 growth markets across the world.', 'payu'),
-                'desc_tip' => true
-            ),
-            'payu_feedback' => array(
-                'title' => __('Automatic collection:', 'payu'),
-                'type' => 'checkbox',
-                'description' => __('Automatic collection makes it possible to automatically confirm incoming payments.', 'payu'),
-                'label' => ' ',
-                'default' => 'no',
-                'desc_tip' => true
-            )
-        );
-    }
-
-    /**
-     * @param array $currencies
-     * @return array
-     */
-    private function getFormFieldConfig($currencies = [])
-    {
-        if (count($currencies) < 2) {
-            $currencies = array('');
-        }
-        $config = array();
-
-        foreach ($currencies as $code) {
-            $idSuffix = ($code ? '_' : '') . $code;
-            $namePrefix = $code . ($code ? ' - ' : '');
-
-            $config += array(
-                'pos_id' . $idSuffix => array(
-                    'title' => $namePrefix . __('Id point of sales:', 'payu'),
-                    'type' => 'text',
-                    'description' => $namePrefix . __('Pos identifier from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                ),
-                'md5' . $idSuffix => array(
-                    'title' => $namePrefix . __('Second key (MD5):', 'payu'),
-                    'type' => 'text',
-                    'description' => __('Second key from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                ),
-                'client_id' . $idSuffix => array(
-                    'title' => $namePrefix . __('OAuth - client_id:', 'payu'),
-                    'type' => 'text',
-                    'description' => __('Client Id for OAuth identifier  from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                ),
-                'client_secret' . $idSuffix => array(
-                    'title' => $namePrefix . __('OAuth - client_secret:', 'payu'),
-                    'type' => 'text',
-                    'description' => __('First key from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                ),
-                'sandbox_pos_id' . $idSuffix => array(
-                    'title' => $namePrefix . __('Sandbox - Id point of sales:', 'payu'),
-                    'type' => 'text',
-                    'description' => __('Pos identifier from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                ),
-                'sandbox_md5' . $idSuffix => array(
-                    'title' => $namePrefix . __('Sandbox - Second key (MD5):', 'payu'),
-                    'type' => 'text',
-                    'description' => __('Second key from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                ),
-                'sandbox_client_id' . $idSuffix => array(
-                    'title' => $namePrefix . __('Sandbox - OAuth - client_id:', 'payu'),
-                    'type' => 'text',
-                    'description' => __('Client Id for OAuth identifier  from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                ),
-                'sandbox_client_secret' . $idSuffix => array(
-                    'title' =>$namePrefix .  __('Sandbox - OAuth - client_secret:', 'payu'),
-                    'type' => 'text',
-                    'description' => __('First key from "Configuration Keys" section of PayU management panel.', 'payu'),
-                    'desc_tip' => true
-                )
-            );
-        }
-        return $config;
     }
 }
 
